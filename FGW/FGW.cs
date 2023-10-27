@@ -1,37 +1,32 @@
-﻿using System;
+﻿using DevExpress.XtraGrid.Views.Grid;
+using Impinj.OctaneSdk;
+using System;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Data;
+using System.Data.SqlClient;
 using System.Drawing;
 using System.IO;
 using System.Linq;
-using System.Runtime.Remoting.Messaging;
 using System.Text;
 using System.Threading;
+using System.Threading.Tasks;
 using System.Windows.Forms;
-using DevExpress.Utils.StructuredStorage.Internal;
-using DevExpress.Utils.StructuredStorage.Internal.Reader;
-using DevExpress.Utils.StructuredStorage.Internal.Writer;
-using DevExpress.XtraBars.Docking;
-using DevExpress.XtraBars.Docking2010;
-using DevExpress.XtraEditors;
-using DevExpress.XtraGrid.Views.Grid;
-using Impinj.OctaneSdk;
-using Impinj.RShell;
-using Org.LLRP.LTK.LLRPV1;
-using Org.LLRP.LTK.LLRPV1.DataType;
-using Org.LLRP.LTK.LLRPV1.Impinj;
-using static System.Windows.Forms.VisualStyles.VisualStyleElement;
 
 namespace FGW
 {
     public partial class FinishedGoodsWarehouse : DevExpress.XtraEditors.XtraForm
     {
         private ImpinjReader ImpinjReader;
-        private bool isConnected = false; 
+        private bool isConnected = false;
         private BindingList<RFIDTag> rfidTagList;
         private HashSet<string> RFIDHashSet;
         private string dailyFolderPath = Path.Combine(Path.GetTempPath(), ".RFIDHashSet");
+        string connString = "Data Source=10.17.215.12;Initial Catalog=FEAERP_VN;User ID=erpuser;Password=feaszerp2010";
+        private readonly object lockObject = new object();
+        private bool isDataUpdateRunning = false; string locationFile = @"D:\RFIDInput";
+
+        private DataSet ds = new DataSet();
         public class RFIDTag
         {
             public string RFID { get; set; }
@@ -39,19 +34,24 @@ namespace FGW
         public FinishedGoodsWarehouse()
         {
             InitializeComponent();
-            
+            if (System.Deployment.Application.ApplicationDeployment.IsNetworkDeployed)
+            {
+                System.Deployment.Application.ApplicationDeployment ad = System.Deployment.Application.ApplicationDeployment.CurrentDeployment;
+                this.Text += " (Version: " + ad.CurrentVersion.ToString() + ")";
+            }
         }
         #region Form Load
-        private void FinishedGoodsWarehouse_Load(object sender, EventArgs e) {
+        private void FinishedGoodsWarehouse_Load(object sender, EventArgs e)
+        {
             rfidTagList = new BindingList<RFIDTag>();
             BindingSource bindingSource = new BindingSource(rfidTagList, null);
             gcRFIDInput.DataSource = bindingSource;
             RFIDHashSet = new HashSet<string>();
             InitializeContextMenu();
             InitializeDaily();
+            StartLoadDataThread();
         }
         #endregion
-
         #region Form Close
         private void FinishedGoodsWarehouse_FormClosing(object sender, FormClosingEventArgs e)
         {
@@ -61,8 +61,79 @@ namespace FGW
                 ImpinjReader.Stop();
                 ImpinjReader.Disconnect();
             }
+            Application.Exit();
         }
         #endregion
+        private async void StartLoadDataThread()
+        {
+            if (!isDataUpdateRunning)
+            {
+                Thread loadDataThread = new Thread(LoadData);
+                loadDataThread.Start();
+            }
+        }
+
+        private async Task LoadData2Async()
+        {
+            string sql = @"SELECT TOP 75000 * FROM  dbo.MaximUPCAndRFID";
+
+            DataSet mainDataSet = new DataSet();
+
+            using (var connection = new System.Data.SqlClient.SqlConnection(connString))
+            {
+                var dataAdapter = new SqlDataAdapter();
+                var command = new SqlCommand(sql, connection);
+                dataAdapter.SelectCommand = command;
+                System.Data.DataTable dataTable = new System.Data.DataTable();
+                await Task.Run(() => dataAdapter.Fill(dataTable));
+                gcData.MainView = gridView1;
+                gcData.DataSource = dataTable;
+                //await Task.Delay(5000);
+                //gcData.DataSource = null;
+            }
+        }
+
+        private void btnLoad_Click(object sender, EventArgs e)
+        {
+            Thread loadDataThread = new Thread(LoadData);
+            loadDataThread.Start();
+        }
+        private async void LoadData()
+        {
+            isDataUpdateRunning = true;
+            while (true)
+            {
+                Invoke((MethodInvoker)async delegate
+                {
+                    string sql = @"DROP TABLE IF EXISTS #tempRPSO
+                            SELECT * INTO #tempRPSO FROM dbo.RFIDProductStockOut AS rpso
+                            SELECT tr.OrderCode, SUM(tr.Quantity) AS[Sum Quantity], SUM(tr.ScannedQuantity) AS[Sum Scanned Quantity] FROM #tempRPSO AS tr GROUP BY tr.OrderCode
+                            SELECT *FROM #tempRPSO AS tr WHERE tr.OrderCode IN (SELECT DISTINCT tr.OrderCode FROM #tempRPSO AS tr2) ORDER BY tr.OrderCode";
+                    DataSet ds = new DataSet();
+
+                    using (var connection = new System.Data.SqlClient.SqlConnection(connString))
+                    {
+                        var dataAdapter = new SqlDataAdapter();
+                        var command = new SqlCommand(sql, connection);
+                        dataAdapter.SelectCommand = command;
+                        await Task.Run(() => dataAdapter.Fill(ds));
+
+                        ds.Tables[0].TableName = "Main";
+                        ds.Tables[1].TableName = "Detail";
+
+                        System.Data.DataColumn key1 = ds.Tables["Main"].Columns["OrderCode"];
+                        System.Data.DataColumn key2 = ds.Tables["Detail"].Columns["OrderCode"];
+                        ds.Relations.Add("ex1", key1, key2);
+                    }
+                    gcData.LevelTree.Nodes.Add("ex1", gvDetailData);
+                    gvDetailData.ViewCaption = "Detail";
+                    gcData.DataSource = ds.Tables["Main"];
+                    gcData.ForceInitialize();
+                });
+                Thread.Sleep(TimeSpan.FromSeconds(30));
+            }
+        }
+       
 
         #region Initialize
         private void InitializeDaily()
@@ -109,8 +180,15 @@ namespace FGW
         #region CustomDrawRowIndicator
         private void gvRFIDInput_CustomDrawRowIndicator(object sender, RowIndicatorCustomDrawEventArgs e)
         {
-            DevExpress.XtraGrid.Views.Grid.GridView view = (DevExpress.XtraGrid.Views.Grid.GridView)sender;
-            if (view.DataRowCount != 0 && e.Info.IsRowIndicator && e.RowHandle >= 0)
+
+            if (gvRFIDInput.DataRowCount != 0 && e.Info.IsRowIndicator && e.RowHandle >= 0)
+            {
+                e.Appearance.TextOptions.HAlignment = DevExpress.Utils.HorzAlignment.Center; e.Info.DisplayText = (e.RowHandle + 1).ToString();
+            }
+        }
+        private void gvData_CustomDrawRowIndicator(object sender, RowIndicatorCustomDrawEventArgs e)
+        {
+            if (gvData.DataRowCount != 0 && e.Info.IsRowIndicator && e.RowHandle >= 0)
             {
                 e.Appearance.TextOptions.HAlignment = DevExpress.Utils.HorzAlignment.Center; e.Info.DisplayText = (e.RowHandle + 1).ToString();
             }
@@ -127,6 +205,17 @@ namespace FGW
             var rect = e.Bounds; rect.X += 10; e.DefaultDraw();
             e.Cache.DrawString(gv.DataRowCount + " rows", e.Appearance.GetFont(), e.Appearance.GetForeBrush(e.Cache), rect, stringFormat);
             e.Handled = true;
+        }
+        private void gridView1_CustomDrawFooter(object sender, DevExpress.XtraGrid.Views.Base.RowObjectCustomDrawEventArgs e)
+        {
+            DevExpress.XtraGrid.Views.Grid.GridView gv = sender as DevExpress.XtraGrid.Views.Grid.GridView;
+            StringFormat stringFormat = new StringFormat();
+            stringFormat.Alignment = StringAlignment.Near;
+            stringFormat.LineAlignment = StringAlignment.Center;
+            var rect = e.Bounds; rect.X += 10; e.DefaultDraw();
+            e.Cache.DrawString(gv.DataRowCount + " rows", e.Appearance.GetFont(), e.Appearance.GetForeBrush(e.Cache), rect, stringFormat);
+            e.Handled = true;
+
         }
         #endregion
 
@@ -155,7 +244,7 @@ namespace FGW
                     set.AutoStop.Mode = AutoStopMode.None;
                     set.AutoStop.DurationInMs = 0;
                     set.AutoStop.GpiPortNumber = 0;
-                    set.AutoStop.GpiLevel=false;
+                    set.AutoStop.GpiLevel = false;
                     set.AutoStop.Timeout = 0;
                     set.ReaderMode = ReaderMode.MaxThroughput;
                     set.RfMode = 1002;
@@ -261,7 +350,7 @@ namespace FGW
                     set.Keepalives.PeriodInMs = 0;
                     set.Keepalives.EnableLinkMonitorMode = false;
                     set.Keepalives.LinkDownThreshold = 0;
-                    
+
                     set.HoldReportsOnDisconnect = false;
                     set.SpatialConfig.Mode = SpatialMode.Inventory;
                     set.SpatialConfig.Placement.HeightCm = 400;
@@ -281,11 +370,11 @@ namespace FGW
                     set.SpatialConfig.Direction.UpdateIntervalSeconds = 5;
                     set.SpatialConfig.Direction.UpdateReportEnabled = true;
                     set.SpatialConfig.Direction.EntryReportEnabled = true;
-                    set.SpatialConfig.Direction.ExitReportEnabled= true;
+                    set.SpatialConfig.Direction.ExitReportEnabled = true;
                     set.SpatialConfig.Direction.FieldOfView = DirectionFieldOfView.Wide;
                     set.SpatialConfig.Direction.Mode = DirectionMode.HighPerformance;
                     set.SpatialConfig.Direction.TagPopulationLimit = 0;
-                    set.SpatialConfig.Direction.DiagnosticReportEnabled= false;
+                    set.SpatialConfig.Direction.DiagnosticReportEnabled = false;
                     set.SpatialConfig.Direction.MaxTxPower = false;
                     set.SpatialConfig.Direction.TxPowerInDbm = 30;
                     #endregion
@@ -317,7 +406,7 @@ namespace FGW
             }
             catch (Exception ex)
             {
-                isConnected=false;
+                isConnected = false;
                 btnConnect.Text = "Disconnected";
                 btnConnect.BackColor = Color.Red;
                 splashScreenManager.CloseWaitForm();
@@ -327,13 +416,13 @@ namespace FGW
         }
         #endregion
 
-        #region Reader Tag Report & Show Tag on Gridview
+        #region Reader Tag Report & Show Tag on Gridview - Write RFID to file 
         private void Reader_TagsReported(ImpinjReader sender, TagReport report)
         {
             foreach (Tag tag in report)
             {
                 string epc = tag.Epc.ToString();
-                string RFIDTag = epc.Replace(" ","");
+                string RFIDTag = epc.Replace(" ", string.Empty);
                 if (!RFIDHashSet.Contains(RFIDTag))
                 {
                     AddTagToGridView(RFIDTag);
@@ -342,6 +431,9 @@ namespace FGW
                 }
             }
         }
+        private DateTime lastFileWriteTime = DateTime.Now;
+        //private TimeSpan interval = TimeSpan.FromSeconds(15);
+
         private void AddTagToGridView(string RFIDTag)
         {
 
@@ -354,14 +446,50 @@ namespace FGW
                 gvRFIDInput.AddNewRow();
                 gvRFIDInput.SetRowCellValue(gvRFIDInput.FocusedRowHandle, "RFID", RFIDTag);
                 gvRFIDInput.UpdateCurrentRow();
-                if (gvRFIDInput.DataRowCount >= 10)
+                if (DateTime.Now - lastFileWriteTime >= TimeSpan.FromMinutes(Int32.Parse(txtTime.Text.Trim().ToString())) && gvRFIDInput.DataRowCount > 0)
                 {
+                    lastFileWriteTime = DateTime.Now;
                     WriteGridViewDataToFile();
-                    currentRowCount = 0;
-                    rfidTagList.Clear();
+                    gvRFIDInput.ViewCaption = "Input Data - Last write: " + lastFileWriteTime.ToString("HH:mm:ss:fff");
                 }
             }
         }
+        #region Write RFIDTag to Text File
+
+        private void WriteGridViewDataToFile()
+        {
+            
+            try
+            {
+                if (!System.IO.Directory.Exists(locationFile))
+                    System.IO.Directory.CreateDirectory(locationFile);
+
+                string fileName = $"RFID.txt";
+                string filePath = System.IO.Path.Combine(locationFile, fileName);
+                List<string> rfidList = rfidTagList.Select(tag => tag.RFID).ToList();
+                rfidTagList.Clear();
+                //File.WriteAllLines(filePath, rfidList);
+                using (StreamWriter writer = new StreamWriter(filePath))
+                {
+                    foreach (string rfid in rfidList)
+                    {
+                        writer.WriteLine(rfid);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                DevExpress.XtraEditors.XtraMessageBox.Show(ex.Message);
+            }
+        }
+
+        private void WriteFinalDataToFile()
+        {
+            if (gvRFIDInput.DataRowCount > 0)
+                WriteGridViewDataToFile();
+        }
+        #endregion
+
         #endregion
 
         #region Load - Write Daily File RFIDHashSet 
@@ -405,41 +533,7 @@ namespace FGW
         }
         #endregion
 
-        #region Write RFIDTag to Text File
 
-        private int currentRowCount = 0;
-        private void WriteGridViewDataToFile()
-        {
-            try
-            {
-                if (!System.IO.Directory.Exists(@"D:\RFIDInput"))
-                    System.IO.Directory.CreateDirectory(@"D:\RFIDInput");
-
-                string fileName = $"RFID-{DateTime.Now.ToString("yyyyMMddHHmmssfff")}.txt";
-                string filePath = System.IO.Path.Combine(@"D:\RFIDInput", fileName);
-
-                using (System.IO.StreamWriter writer = new System.IO.StreamWriter(filePath))
-                {
-                    DevExpress.XtraGrid.Views.Grid.GridView gridView = gvRFIDInput;
-                    for (int i = 0; i < gridView.DataRowCount; i++)
-                    {
-                        string rfid = gridView.GetRowCellValue(i, "RFID").ToString();
-                        writer.WriteLine(rfid);
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                DevExpress.XtraEditors.XtraMessageBox.Show(ex.Message);
-            }
-        }
-
-        private void WriteFinalDataToFile()
-        {
-            if (currentRowCount > 0)
-                WriteGridViewDataToFile();
-        }
-        #endregion
 
         #region Custom Export Text file RFID Tag on Click
         private void InitializeContextMenu()
@@ -472,11 +566,32 @@ namespace FGW
 
                 }
                 File.WriteAllLines(filePath, dataToExport);
-                toastNotificationsManager1.ShowNotification(toastNotificationsManager1.Notifications[0]);
+                toastNotificationsManager.ShowNotification(toastNotificationsManager.Notifications[0]);
             }
         }
+
         #endregion
 
-        
+        private void gvData_RowCellStyle(object sender, RowCellStyleEventArgs e)
+        {
+            GridView view = sender as GridView;
+            if (e.RowHandle >= 0)
+            {
+                int quantity = Convert.ToInt32(view.GetRowCellValue(e.RowHandle, "Sum Quantity"));
+                int scannedQuantity = Convert.ToInt32(view.GetRowCellValue(e.RowHandle, "Sum Scanned Quantity"));
+
+                if (quantity > scannedQuantity && scannedQuantity > 0)
+                {
+                    e.Appearance.BackColor = Color.DarkRed;
+                    e.Appearance.ForeColor = Color.White;
+                }
+                else if (quantity == scannedQuantity)
+                {
+                    e.Appearance.BackColor = Color.DarkGreen;
+                    e.Appearance.ForeColor = Color.White;
+                }
+            }
+        }
+
     }
 }
